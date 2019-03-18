@@ -150,6 +150,8 @@ class MADDPG:
 
         self.gamma = 0.99
 
+        self.timesteps = 0
+
         self.actors = [
             FCNetwork((state_sizes[i], 128, 128, action_sizes[i]))
             for i in range(agent_count)
@@ -175,11 +177,11 @@ class MADDPG:
 
         self.batch_size = batch_size
 
-    def select_actions(self, states):
+    def select_actions(self, states, explore=False):
         """
 
         :param states: List of the agent states
-        :return:
+        :return: actions for each agent
         """
 
         actions = []
@@ -189,14 +191,8 @@ class MADDPG:
 
             action = onehot_from_logits(
                 self.actors[i](sb.unsqueeze(0)),
-                epsilon=0.3
+                epsilon=0.3 if explore else 0.0
             ).squeeze()
-
-            # if i == 0:
-            #     color = np.argmax(state)
-            #     action = torch.zeros(3)
-            #     action[color] = 1.0
-
             actions.append(action)
 
         return actions
@@ -254,13 +250,12 @@ class MADDPG:
         self.actor_optimizers[agent].step()
 
 
-    def play_episode(self, env, render=False):
-        global timesteps
+    def play_episode(self, env, evaluate=False, render=False):
         obs_n = env.reset()
         for _ in range(EPISODE_LENGTH):
             # query for action from each agent's policy
             # act_n = [np.array([0, 0, 1]), env.action_space[1].sample()]
-            actions = [a.detach().numpy() for a in self.select_actions(obs_n)]
+            actions = [a.detach().numpy() for a in self.select_actions(obs_n, explore=(not evaluate))]
 
             # step environment
             next_obs_n, reward_n, done_n, _ = env.step(actions)
@@ -271,27 +266,29 @@ class MADDPG:
             if render:
                 env.render()
 
-            if timesteps % 100 == 0:
-                print(timesteps)
-                for agent in range(self.agent_count):
-                    self.update(agent)
-                for i in range(self.agent_count):
-                    self.actor_targets[i].soft_update(self.actors[i], 0.05)
-                    self.critic_targets[i].soft_update(self.critics[i], 0.05)
-
-            timesteps += 1
+            self.timesteps += 1
             obs_n = next_obs_n
+
+            if evaluate or self.timesteps % 100 != 0:
+                continue
+
+            for agent in range(self.agent_count):
+                self.update(agent)
+            for i in range(self.agent_count):
+                self.actor_targets[i].soft_update(self.actors[i], 0.05)
+                self.critic_targets[i].soft_update(self.critics[i], 0.05)
 
             # display rewards
             # for agent in env.world.agents:
                 # print(agent.name + " reward: %0.3f" % env._get_reward(agent))
 
-timesteps = 0
+
 def main():
     env = make_env('simple_speaker_listener', discrete_action=True)
     maddpg = MADDPG()
     for i in range(MAX_EPISODES):
-        maddpg.play_episode(env, render=True)
+        evaluate = i % 100 < 10
+        maddpg.play_episode(env, evaluate=evaluate, render=evaluate)
 
 
 if __name__ == '__main__':
