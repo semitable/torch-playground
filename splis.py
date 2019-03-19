@@ -6,6 +6,7 @@ import numpy as np
 import multiagent.scenarios as scenarios
 from multiagent.environment import MultiAgentEnv
 from torch.optim import Adam
+import argparse
 import random
 from collections import namedtuple
 from networks import FCNetwork
@@ -93,7 +94,7 @@ Transition = namedtuple('Transition', ('states', 'actions', 'next_states', 'rewa
 
 class ReplayBuffer:
     def __init__(self, capacity):
-        self.capacity = capacity
+        self.capacity = int(capacity)
         self.memory = []
         self.position = 0
 
@@ -140,42 +141,44 @@ class MultiAgentReplayBuffer:
 
 
 class MADDPG:
-    def __init__(self):
+    def __init__(self, params):
         state_sizes = [3, 11]
         action_sizes = [3, 5]
         agent_count = 2
-        batch_size = 1024
 
-        self.discrete_actions = [True, True]
+        # self.discrete_actions = [True, True]
 
-        self.gamma = 0.99
+        self.gamma = params['discount']
+        self.update_freq = params['update_freq']
+        self.batch_size = params['batch_size']
+        self.target_tau = params['target_tau']
+        self.grad_clip = params['grad_clip']
 
         self.timesteps = 0
 
         self.actors = [
-            FCNetwork((state_sizes[i], 128, 128, action_sizes[i]))
+            FCNetwork((state_sizes[i], 64, 64, action_sizes[i]))
             for i in range(agent_count)
         ]
 
         critic_input_size = sum(state_sizes) + sum(action_sizes)
         self.critics = [
-            FCNetwork((critic_input_size, 256, 256, 1))
+            FCNetwork((critic_input_size, 64, 64, 1))
             for i in range(agent_count)
         ]
 
         self.actor_targets = copy.deepcopy(self.actors)
         self.critic_targets = copy.deepcopy(self.critics)
 
-        self.critic_optimizers = [Adam(x.parameters(), lr=0.01) for x in self.critics]
-        self.actor_optimizers = [Adam(x.parameters(), lr=0.01) for x in self.actors]
+        self.critic_optimizers = [Adam(x.parameters(), lr=params['critic_lr']) for x in self.critics]
+        self.actor_optimizers = [Adam(x.parameters(), lr=params['actor_lr']) for x in self.actors]
 
         self.agent_count = agent_count
         self.state_size = state_sizes
         self.action_size = action_sizes
 
-        self.replay_buffer = MultiAgentReplayBuffer(agent_count, 1000000)
+        self.replay_buffer = MultiAgentReplayBuffer(agent_count, params['buffer_size'])
 
-        self.batch_size = batch_size
 
     def select_actions(self, states, explore=False):
         """
@@ -188,12 +191,11 @@ class MADDPG:
 
         for i, state in enumerate(states):
             sb = torch.Tensor(state)
-
-            action = onehot_from_logits(
-                self.actors[i](sb.unsqueeze(0)),
-                epsilon=0.3 if explore else 0.0
-            ).squeeze()
-            actions.append(action)
+            if explore:
+                action = gumbel_softmax(self.actors[i](sb.unsqueeze(0)), hard=True)
+            else:
+                action = onehot_from_logits(self.actors[i](sb.unsqueeze(0)))
+            actions.append(action.squeeze().detach())
 
         return actions
 
@@ -231,6 +233,7 @@ class MADDPG:
         self.critic_optimizers[agent].zero_grad()
         loss = MSELoss(value, target_value)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critics[agent].parameters(), self.grad_clip)
         self.critic_optimizers[agent].step()
 
         #####################################
@@ -247,6 +250,7 @@ class MADDPG:
         self.actor_optimizers[agent].zero_grad()
         loss = -torch.mean(qvalue)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actors[agent].parameters(), self.grad_clip)
         self.actor_optimizers[agent].step()
 
 
@@ -276,14 +280,14 @@ class MADDPG:
 
             self.timesteps += 1
 
-            if self.timesteps % 100 != 0:
+            if self.timesteps % self.update_freq != 0:
                 continue
 
             for agent in range(self.agent_count):
                 self.update(agent)
             for i in range(self.agent_count):
-                self.actor_targets[i].soft_update(self.actors[i], 0.01)
-                self.critic_targets[i].soft_update(self.critics[i], 0.01)
+                self.actor_targets[i].soft_update(self.actors[i], self.target_tau)
+                self.critic_targets[i].soft_update(self.critics[i], self.target_tau)
 
         return episode_rewards
 
@@ -295,29 +299,52 @@ def plot_rewards(rewards):
     plt.xlabel('Episode')
     plt.ylabel('Duration')
     plt.plot(rewards[:, 0])
+    plt.ylim(top=0)
     plt.pause(0.001)  # pause a bit so that plots are updated
 
-def evaluate(env, maddpg, rewards):
+def evaluate(env, maddpg, rewards, eval_episodes):
     episode_rewards = np.zeros(2)
-    for i in range(10):
-        episode_rewards += maddpg.play_episode(env, evaluate=True, render=True) / 10.0
+    for i in range(eval_episodes):
+        episode_rewards += maddpg.play_episode(env, evaluate=True, render=True) / eval_episodes
 
     rewards = np.vstack([rewards, episode_rewards]) if rewards is not None else np.array([episode_rewards])
-    plot_rewards(rewards)
+    # plot_rewards(rewards)
+    print(rewards)
     return rewards
 
 
-def main():
+def main(**params):
 
     plt.ion()
     rewards = None
 
     env = make_env('simple_speaker_listener', discrete_action=True)
-    maddpg = MADDPG()
+    maddpg = MADDPG(params)
     for i in range(MAX_EPISODES):
         _ = maddpg.play_episode(env, evaluate=False, render=False)
-        if i % 100 == 0:
-            rewards = evaluate(env, maddpg, rewards)
+        if i % params['eval_every'] == 0:
+            rewards = evaluate(env, maddpg, rewards, params['eval_episodes'])
+            print("Episode: ", i)
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    # Example on how to initialize global locks for processes
+    # and counters.
+
+    parser = argparse.ArgumentParser()
+    # parser.add_argument('--hidden-layers', type=int, nargs='+', default=[64, 64])
+    parser.add_argument('--max-timesteps', default=1e7, type=float)
+    parser.add_argument('--update-freq', type=float, default=100)
+    parser.add_argument('--target-tau', type=float, default=0.01)
+    parser.add_argument('--grad-clip', type=float, default=0.5)
+    parser.add_argument('--critic-lr', type=float, default=0.01)
+    parser.add_argument('--actor-lr', type=float, default=0.01)
+    parser.add_argument('--eval-episodes', type=int, default=10)
+    parser.add_argument('--eval-every', type=int, default=1000)
+    parser.add_argument('--buffer-size', type=int, default=1e6)
+    parser.add_argument('--batch-size', type=int, default=1024)
+    parser.add_argument('--discount', type=float, default=0.99)
+    # parser.add_argument('--render-evals', action='store_true')
+
+    args = parser.parse_args()
+
+    main(**vars(args))
