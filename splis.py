@@ -10,7 +10,7 @@ import random
 from collections import namedtuple
 from networks import FCNetwork
 from operator import itemgetter
-
+import matplotlib.pyplot as plt
 
 MSELoss = torch.nn.MSELoss()
 EPISODE_LENGTH = 25
@@ -252,6 +252,8 @@ class MADDPG:
 
     def play_episode(self, env, evaluate=False, render=False):
         obs_n = env.reset()
+        episode_rewards = np.zeros(2)
+
         for _ in range(EPISODE_LENGTH):
             # query for action from each agent's policy
             # act_n = [np.array([0, 0, 1]), env.action_space[1].sample()]
@@ -259,6 +261,7 @@ class MADDPG:
 
             # step environment
             next_obs_n, reward_n, done_n, _ = env.step(actions)
+            episode_rewards += reward_n
 
             self.replay_buffer.push(obs_n, actions, next_obs_n, reward_n, done_n)
 
@@ -266,30 +269,55 @@ class MADDPG:
             if render:
                 env.render()
 
-            self.timesteps += 1
             obs_n = next_obs_n
 
-            if evaluate or self.timesteps % 100 != 0:
+            if evaluate:
+                continue
+
+            self.timesteps += 1
+
+            if self.timesteps % 100 != 0:
                 continue
 
             for agent in range(self.agent_count):
                 self.update(agent)
             for i in range(self.agent_count):
-                self.actor_targets[i].soft_update(self.actors[i], 0.05)
-                self.critic_targets[i].soft_update(self.critics[i], 0.05)
+                self.actor_targets[i].soft_update(self.actors[i], 0.01)
+                self.critic_targets[i].soft_update(self.critics[i], 0.01)
 
-            # display rewards
-            # for agent in env.world.agents:
-                # print(agent.name + " reward: %0.3f" % env._get_reward(agent))
+        return episode_rewards
+
+def plot_rewards(rewards):
+    plt.figure(1)
+    plt.clf()
+    plt.yscale("symlog")
+    plt.title('Training...')
+    plt.xlabel('Episode')
+    plt.ylabel('Duration')
+    plt.plot(rewards[:, 0])
+    plt.pause(0.001)  # pause a bit so that plots are updated
+
+def evaluate(env, maddpg, rewards):
+    episode_rewards = np.zeros(2)
+    for i in range(10):
+        episode_rewards += maddpg.play_episode(env, evaluate=True, render=True) / 10.0
+
+    rewards = np.vstack([rewards, episode_rewards]) if rewards is not None else np.array([episode_rewards])
+    plot_rewards(rewards)
+    return rewards
 
 
 def main():
+
+    plt.ion()
+    rewards = None
+
     env = make_env('simple_speaker_listener', discrete_action=True)
     maddpg = MADDPG()
     for i in range(MAX_EPISODES):
-        evaluate = i % 100 < 10
-        maddpg.play_episode(env, evaluate=evaluate, render=evaluate)
-
+        _ = maddpg.play_episode(env, evaluate=False, render=False)
+        if i % 100 == 0:
+            rewards = evaluate(env, maddpg, rewards)
 
 if __name__ == '__main__':
     main()
