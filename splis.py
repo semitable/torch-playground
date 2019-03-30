@@ -40,9 +40,22 @@ def make_env(scenario_name, benchmark=False, discrete_action=False):
     world = scenario.make_world()
     # create multiagent environment
     if benchmark:
-        env = MultiAgentEnv(world, scenario.reset_world, scenario.reward, scenario.observation, scenario.benchmark_data, discrete_action=discrete_action)
+        env = MultiAgentEnv(
+            world,
+            scenario.reset_world,
+            scenario.reward,
+            scenario.observation,
+            scenario.benchmark_data,
+            discrete_action=discrete_action,
+        )
     else:
-        env = MultiAgentEnv(world, scenario.reset_world, scenario.reward, scenario.observation, discrete_action=discrete_action)
+        env = MultiAgentEnv(
+            world,
+            scenario.reset_world,
+            scenario.reward,
+            scenario.observation,
+            discrete_action=discrete_action,
+        )
     return env
 
 
@@ -56,20 +69,33 @@ def onehot_from_logits(logits, epsilon=0.0):
     if epsilon == 0.0:
         return argmax_acs
     # get random actions in one-hot form
-    rand_acs = Variable(torch.eye(logits.shape[1])[[np.random.choice(range(logits.shape[1]), size=logits.shape[0])]], requires_grad=False)
+    rand_acs = Variable(
+        torch.eye(logits.shape[1])[
+            [np.random.choice(range(logits.shape[1]), size=logits.shape[0])]
+        ],
+        requires_grad=False,
+    )
     # chooses between best and random actions using epsilon greedy
-    return torch.stack([argmax_acs[i] if r > epsilon else rand_acs[i] for i, r in enumerate(torch.rand(logits.shape[0]))])
+    return torch.stack(
+        [
+            argmax_acs[i] if r > epsilon else rand_acs[i]
+            for i, r in enumerate(torch.rand(logits.shape[0]))
+        ]
+    )
+
 
 def sample_gumbel(shape, eps=1e-20, tens_type=torch.FloatTensor):
     """Sample from Gumbel(0, 1)"""
     U = Variable(tens_type(*shape).uniform_(), requires_grad=False)
     return -torch.log(-torch.log(U + eps) + eps)
 
+
 # modified for PyTorch from https://github.com/ericjang/gumbel-softmax/blob/master/Categorical%20VAE.ipynb
 def gumbel_softmax_sample(logits, temperature):
     """ Draw a sample from the Gumbel-Softmax distribution"""
     y = logits + sample_gumbel(logits.shape, tens_type=type(logits.data))
     return F.softmax(y / temperature, dim=1)
+
 
 # modified for PyTorch from https://github.com/ericjang/gumbel-softmax/blob/master/Categorical%20VAE.ipynb
 def gumbel_softmax(logits, temperature=1.0, hard=False):
@@ -89,7 +115,10 @@ def gumbel_softmax(logits, temperature=1.0, hard=False):
         y = (y_hard - y).detach() + y
     return y
 
-Transition = namedtuple('Transition', ('states', 'actions', 'next_states', 'rewards', 'done'))
+
+Transition = namedtuple(
+    "Transition", ("states", "actions", "next_states", "rewards", "done")
+)
 
 
 class ReplayBuffer:
@@ -111,6 +140,7 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.memory)
 
+
 class MultiAgentReplayBuffer:
     def __init__(self, agents, capacity):
         self.agents = agents
@@ -126,7 +156,9 @@ class MultiAgentReplayBuffer:
         for buffer in self.sa_buffers:
             transitions = itemgetter(*samples)(buffer.memory)
             if tensorize:
-                batch = Transition(*[torch.Tensor(e).view(batch_size, -1) for e in zip(*transitions)])
+                batch = Transition(
+                    *[torch.Tensor(e).view(batch_size, -1) for e in zip(*transitions)]
+                )
             else:
                 batch = Transition(*zip(*transitions))
             agent_batches.append(batch)
@@ -138,8 +170,6 @@ class MultiAgentReplayBuffer:
             buffer.push(*[a[i] for a in args])
 
 
-
-
 class MADDPG:
     def __init__(self, params):
         state_sizes = [3, 11]
@@ -148,11 +178,11 @@ class MADDPG:
 
         # self.discrete_actions = [True, True]
 
-        self.gamma = params['discount']
-        self.update_freq = params['update_freq']
-        self.batch_size = params['batch_size']
-        self.target_tau = params['target_tau']
-        self.grad_clip = params['grad_clip']
+        self.gamma = params["discount"]
+        self.update_freq = params["update_freq"]
+        self.batch_size = params["batch_size"]
+        self.target_tau = params["target_tau"]
+        self.grad_clip = params["grad_clip"]
 
         self.timesteps = 0
 
@@ -163,22 +193,24 @@ class MADDPG:
 
         critic_input_size = sum(state_sizes) + sum(action_sizes)
         self.critics = [
-            FCNetwork((critic_input_size, 64, 64, 1))
-            for i in range(agent_count)
+            FCNetwork((critic_input_size, 64, 64, 1)) for i in range(agent_count)
         ]
 
         self.actor_targets = copy.deepcopy(self.actors)
         self.critic_targets = copy.deepcopy(self.critics)
 
-        self.critic_optimizers = [Adam(x.parameters(), lr=params['critic_lr']) for x in self.critics]
-        self.actor_optimizers = [Adam(x.parameters(), lr=params['actor_lr']) for x in self.actors]
+        self.critic_optimizers = [
+            Adam(x.parameters(), lr=params["critic_lr"]) for x in self.critics
+        ]
+        self.actor_optimizers = [
+            Adam(x.parameters(), lr=params["actor_lr"]) for x in self.actors
+        ]
 
         self.agent_count = agent_count
         self.state_size = state_sizes
         self.action_size = action_sizes
 
-        self.replay_buffer = MultiAgentReplayBuffer(agent_count, params['buffer_size'])
-
+        self.replay_buffer = MultiAgentReplayBuffer(agent_count, params["buffer_size"])
 
     def select_actions(self, states, explore=False):
         """
@@ -213,17 +245,19 @@ class MADDPG:
         jnext_states = torch.cat([batch.next_states for batch in nbatch], dim=1)
 
         target_actions = torch.cat(
-            [onehot_from_logits(tp(batch.next_states)) for tp, batch in zip(self.actor_targets, nbatch)],
-            dim=1
+            [
+                onehot_from_logits(tp(batch.next_states))
+                for tp, batch in zip(self.actor_targets, nbatch)
+            ],
+            dim=1,
         ).detach()
-
 
         target_critic_in = torch.cat((jnext_states, target_actions), dim=1)
 
         target_value = (
             nbatch[agent].rewards
             + self.gamma
-            * (1-nbatch[agent].done)
+            * (1 - nbatch[agent].done)
             * self.critic_targets[agent](target_critic_in)
         ).detach()
 
@@ -238,10 +272,15 @@ class MADDPG:
 
         #####################################
 
-        jactions = torch.cat([
-            gumbel_softmax(self.actors[agent](batch.states), hard=True) if i == agent else batch.actions
-            for i, batch in enumerate(nbatch)
-        ], dim=1)
+        jactions = torch.cat(
+            [
+                gumbel_softmax(self.actors[agent](batch.states), hard=True)
+                if i == agent
+                else batch.actions
+                for i, batch in enumerate(nbatch)
+            ],
+            dim=1,
+        )
 
         critic_in = torch.cat([jstates, jactions], dim=1)
 
@@ -253,7 +292,6 @@ class MADDPG:
         torch.nn.utils.clip_grad_norm_(self.actors[agent].parameters(), self.grad_clip)
         self.actor_optimizers[agent].step()
 
-
     def play_episode(self, env, evaluate=False, render=False):
         obs_n = env.reset()
         episode_rewards = np.zeros(2)
@@ -261,7 +299,10 @@ class MADDPG:
         for _ in range(EPISODE_LENGTH):
             # query for action from each agent's policy
             # act_n = [np.array([0, 0, 1]), env.action_space[1].sample()]
-            actions = [a.detach().numpy() for a in self.select_actions(obs_n, explore=(not evaluate))]
+            actions = [
+                a.detach().numpy()
+                for a in self.select_actions(obs_n, explore=(not evaluate))
+            ]
 
             # step environment
             next_obs_n, reward_n, done_n, _ = env.step(actions)
@@ -291,23 +332,31 @@ class MADDPG:
 
         return episode_rewards
 
+
 def plot_rewards(rewards):
     plt.figure(1)
     plt.clf()
     plt.yscale("symlog")
-    plt.title('Training...')
-    plt.xlabel('Episode')
-    plt.ylabel('Duration')
+    plt.title("Training...")
+    plt.xlabel("Episode")
+    plt.ylabel("Duration")
     plt.plot(rewards[:, 0])
     plt.ylim(top=0)
     plt.pause(0.001)  # pause a bit so that plots are updated
 
+
 def evaluate(env, maddpg, rewards, eval_episodes):
     episode_rewards = np.zeros(2)
     for i in range(eval_episodes):
-        episode_rewards += maddpg.play_episode(env, evaluate=True, render=True) / eval_episodes
+        episode_rewards += (
+            maddpg.play_episode(env, evaluate=True, render=True) / eval_episodes
+        )
 
-    rewards = np.vstack([rewards, episode_rewards]) if rewards is not None else np.array([episode_rewards])
+    rewards = (
+        np.vstack([rewards, episode_rewards])
+        if rewards is not None
+        else np.array([episode_rewards])
+    )
     # plot_rewards(rewards)
     print(rewards)
     return rewards
@@ -318,13 +367,14 @@ def main(**params):
     plt.ion()
     rewards = None
 
-    env = make_env('simple_speaker_listener', discrete_action=True)
+    env = make_env("simple_speaker_listener", discrete_action=True)
     maddpg = MADDPG(params)
     for i in range(MAX_EPISODES):
         _ = maddpg.play_episode(env, evaluate=False, render=False)
-        if i % params['eval_every'] == 0:
-            rewards = evaluate(env, maddpg, rewards, params['eval_episodes'])
+        if i % params["eval_every"] == 0:
+            rewards = evaluate(env, maddpg, rewards, params["eval_episodes"])
             print("Episode: ", i)
+
 
 if __name__ == "__main__":
     # Example on how to initialize global locks for processes
@@ -332,17 +382,17 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     # parser.add_argument('--hidden-layers', type=int, nargs='+', default=[64, 64])
-    parser.add_argument('--max-timesteps', default=1e7, type=float)
-    parser.add_argument('--update-freq', type=float, default=100)
-    parser.add_argument('--target-tau', type=float, default=0.01)
-    parser.add_argument('--grad-clip', type=float, default=0.5)
-    parser.add_argument('--critic-lr', type=float, default=0.01)
-    parser.add_argument('--actor-lr', type=float, default=0.01)
-    parser.add_argument('--eval-episodes', type=int, default=10)
-    parser.add_argument('--eval-every', type=int, default=1000)
-    parser.add_argument('--buffer-size', type=int, default=1e6)
-    parser.add_argument('--batch-size', type=int, default=1024)
-    parser.add_argument('--discount', type=float, default=0.99)
+    parser.add_argument("--max-timesteps", default=1e7, type=float)
+    parser.add_argument("--update-freq", type=float, default=100)
+    parser.add_argument("--target-tau", type=float, default=0.01)
+    parser.add_argument("--grad-clip", type=float, default=0.5)
+    parser.add_argument("--critic-lr", type=float, default=0.01)
+    parser.add_argument("--actor-lr", type=float, default=0.01)
+    parser.add_argument("--eval-episodes", type=int, default=10)
+    parser.add_argument("--eval-every", type=int, default=1000)
+    parser.add_argument("--buffer-size", type=int, default=1e6)
+    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--discount", type=float, default=0.99)
     # parser.add_argument('--render-evals', action='store_true')
 
     args = parser.parse_args()
