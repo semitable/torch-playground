@@ -25,7 +25,7 @@ class FCNetwork(nn.Module):
     def calc_layer_size(size, extra):
         if type(size) is int:
             return size
-        return extra['size']
+        return extra["size"]
 
     def forward(self, x):
         # Feedforward

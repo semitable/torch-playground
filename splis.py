@@ -9,13 +9,15 @@ from torch.optim import Adam
 import argparse
 import random
 from collections import namedtuple
+import gym
+import lbforaging
+import time
 from networks import FCNetwork
 from operator import itemgetter
 import matplotlib.pyplot as plt
 
 MSELoss = torch.nn.MSELoss()
-EPISODE_LENGTH = 25
-MAX_EPISODES = 50000
+MAX_EPISODES = 100000
 
 
 def make_env(scenario_name, benchmark=False, discrete_action=False):
@@ -98,7 +100,7 @@ def gumbel_softmax_sample(logits, temperature):
 
 
 # modified for PyTorch from https://github.com/ericjang/gumbel-softmax/blob/master/Categorical%20VAE.ipynb
-def gumbel_softmax(logits, temperature=1.0, hard=False):
+def gumbel_softmax(logits, temperature=100.0, hard=False):
     """Sample from the Gumbel-Softmax distribution and optionally discretize.
     Args:
       logits: [batch_size, n_class] unnormalized log-probs
@@ -172,8 +174,8 @@ class MultiAgentReplayBuffer:
 
 class MADDPG:
     def __init__(self, params):
-        state_sizes = [3, 11]
-        action_sizes = [3, 5]
+        state_sizes = [9, 9]
+        action_sizes = [6, 6]
         agent_count = 2
 
         # self.discrete_actions = [True, True]
@@ -270,7 +272,7 @@ class MADDPG:
         torch.nn.utils.clip_grad_norm_(self.critics[agent].parameters(), self.grad_clip)
         self.critic_optimizers[agent].step()
 
-        #####################################
+        ########## Update Actors ##################
 
         jactions = torch.cat(
             [
@@ -295,8 +297,9 @@ class MADDPG:
     def play_episode(self, env, evaluate=False, render=False):
         obs_n = env.reset()
         episode_rewards = np.zeros(2)
+        done = False
 
-        for _ in range(EPISODE_LENGTH):
+        while not done:
             # query for action from each agent's policy
             # act_n = [np.array([0, 0, 1]), env.action_space[1].sample()]
             actions = [
@@ -305,7 +308,11 @@ class MADDPG:
             ]
 
             # step environment
-            next_obs_n, reward_n, done_n, _ = env.step(actions)
+            next_obs_n, reward_n, done_n, _ = env.step(
+                [np.argmax(actions[0]), np.argmax(actions[1])]
+            )
+            done = np.all(done_n)
+
             episode_rewards += reward_n
 
             self.replay_buffer.push(obs_n, actions, next_obs_n, reward_n, done_n)
@@ -336,12 +343,11 @@ class MADDPG:
 def plot_rewards(rewards):
     plt.figure(1)
     plt.clf()
-    plt.yscale("symlog")
+    # plt.yscale("symlog")
     plt.title("Training...")
     plt.xlabel("Episode")
     plt.ylabel("Duration")
-    plt.plot(rewards[:, 0])
-    plt.ylim(top=0)
+    plt.plot(np.sum(rewards, axis=1))
     plt.pause(0.001)  # pause a bit so that plots are updated
 
 
@@ -357,7 +363,7 @@ def evaluate(env, maddpg, rewards, eval_episodes):
         if rewards is not None
         else np.array([episode_rewards])
     )
-    # plot_rewards(rewards)
+    plot_rewards(rewards)
     print(rewards)
     return rewards
 
@@ -367,13 +373,17 @@ def main(**params):
     plt.ion()
     rewards = None
 
-    env = make_env("simple_speaker_listener", discrete_action=True)
+    # env = make_env("simple_speaker_listener", discrete_action=True)
+    env = gym.make("Foraging-5x5-2p-v0")
+    # print(env.observation_space)
+    # print(env.action_space)
     maddpg = MADDPG(params)
     for i in range(MAX_EPISODES):
         _ = maddpg.play_episode(env, evaluate=False, render=False)
         if i % params["eval_every"] == 0:
             rewards = evaluate(env, maddpg, rewards, params["eval_episodes"])
             print("Episode: ", i)
+
 
 
 if __name__ == "__main__":
@@ -386,13 +396,13 @@ if __name__ == "__main__":
     parser.add_argument("--update-freq", type=float, default=100)
     parser.add_argument("--target-tau", type=float, default=0.01)
     parser.add_argument("--grad-clip", type=float, default=0.5)
-    parser.add_argument("--critic-lr", type=float, default=0.01)
-    parser.add_argument("--actor-lr", type=float, default=0.01)
-    parser.add_argument("--eval-episodes", type=int, default=10)
-    parser.add_argument("--eval-every", type=int, default=1000)
-    parser.add_argument("--buffer-size", type=int, default=1e6)
+    parser.add_argument("--critic-lr", type=float, default=0.001)
+    parser.add_argument("--actor-lr", type=float, default=0.0001)
+    parser.add_argument("--eval-episodes", type=int, default=20)
+    parser.add_argument("--eval-every", type=int, default=500)
+    parser.add_argument("--buffer-size", type=int, default=1e8)
     parser.add_argument("--batch-size", type=int, default=1024)
-    parser.add_argument("--discount", type=float, default=0.99)
+    parser.add_argument("--discount", type=float, default=0.9)
     # parser.add_argument('--render-evals', action='store_true')
 
     args = parser.parse_args()
