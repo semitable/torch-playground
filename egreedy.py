@@ -222,11 +222,13 @@ class MADDPG:
         """
 
         actions = []
-
+        rand = np.random.uniform()
         for i, state in enumerate(states):
+            # rand = np.random.uniform()
+
             sb = torch.Tensor(state)
-            if explore:
-                action = gumbel_softmax(self.actors[i](sb.unsqueeze(0)), hard=True)
+            if explore and rand < 0.2:
+                action = gumbel_softmax(torch.ones(6).unsqueeze(0), hard=True)
             else:
                 action = onehot_from_logits(self.actors[i](sb.unsqueeze(0)))
             actions.append(action.squeeze().detach())
