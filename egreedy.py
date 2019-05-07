@@ -3,8 +3,8 @@ import torch
 from torch.autograd import Variable
 from torch.functional import F
 import numpy as np
-import multiagent.scenarios as scenarios
-from multiagent.environment import MultiAgentEnv
+# import multiagent.scenarios as scenarios
+# from multiagent.environment import MultiAgentEnv
 from torch.optim import Adam
 import argparse
 import random
