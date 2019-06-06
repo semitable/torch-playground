@@ -91,16 +91,18 @@ def onehot_from_logits(logits, epsilon=0.0):
     )
 
 
-def sample_gumbel(shape, eps=1e-20, tens_type=torch.FloatTensor):
+def sample_gumbel(shape, eps=1e-20, tens_type=torch.FloatTensor, device="cpu"):
     """Sample from Gumbel(0, 1)"""
-    U = Variable(tens_type(*shape).uniform_(), requires_grad=False)
+    U = Variable(tens_type(*shape).uniform_(), requires_grad=False).to(device)
     return -torch.log(-torch.log(U + eps) + eps)
 
 
 # modified for PyTorch from https://github.com/ericjang/gumbel-softmax/blob/master/Categorical%20VAE.ipynb
 def gumbel_softmax_sample(logits, temperature):
     """ Draw a sample from the Gumbel-Softmax distribution"""
-    y = logits + sample_gumbel(logits.shape, tens_type=type(logits.data))
+    y = logits + sample_gumbel(
+        logits.shape, tens_type=type(logits.data), device=logits.device
+    )
     return F.softmax(y / temperature, dim=1)
 
 
@@ -192,11 +194,11 @@ class MADDPG:
             if not self.centralized:
                 rand = np.random.uniform()
 
-            sb = torch.Tensor(state)
+            sb = torch.Tensor(state).to(device)
             if explore and rand < self.epsilon:
                 action = gumbel_softmax(torch.ones(6).unsqueeze(0), hard=True)
             else:
-                action = onehot_from_logits(self.actors[i](sb.unsqueeze(0)))
+                action = onehot_from_logits(self.actors[i](sb.unsqueeze(0))).to("cpu")
             actions.append(action.squeeze().detach())
 
         return actions
@@ -210,8 +212,6 @@ class MADDPG:
             return
 
         nbatch = self.replay_buffer.sample(self.batch_size, device=device)
-        print(nbatch)
-        print(type(nbatch))
         jstates = torch.cat([batch.states for batch in nbatch], dim=1)
         jactions = torch.cat([batch.actions for batch in nbatch], dim=1)
         jnext_states = torch.cat([batch.next_states for batch in nbatch], dim=1)
