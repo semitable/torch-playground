@@ -1,25 +1,24 @@
 from torch import nn
-from torch.functional import F
 
 
 class FCNetwork(nn.Module):
-    def __init__(self, dims):
+    def __init__(self, dims, dropout=False):
         """
         Creates a network using ReLUs between layers and no activation at the end
         :param dims: tuple in the form of (100, 100, ..., 5). for dim sizes
         """
         super().__init__()
-        h_sizes = dims[:-1]
-        out_size = dims[-1]
+        input_size = dims[0]
+        h_sizes = dims[1:]
 
-        # Hidden layers
-        self.hidden = []
-        for k in range(len(h_sizes) - 1):
-            self.hidden.append(nn.Linear(h_sizes[k], h_sizes[k + 1]))
-            self.add_module("hidden_layer" + str(k), self.hidden[-1])
+        mods = [nn.Linear(input_size, h_sizes[0])]
+        for i in range(len(h_sizes) - 1):
+            mods.append(nn.ReLU())
+            if dropout:
+                mods.append(nn.Dropout(p=0.1))
+            mods.append(nn.Linear(h_sizes[i], h_sizes[i + 1]))
 
-        # Output layer
-        self.out = nn.Linear(h_sizes[-1], out_size)
+        self.layers = nn.Sequential(*mods)
 
     @staticmethod
     def calc_layer_size(size, extra):
@@ -29,10 +28,7 @@ class FCNetwork(nn.Module):
 
     def forward(self, x):
         # Feedforward
-        for layer in self.hidden:
-            x = F.relu(layer(x))
-        output = self.out(x)
-        return output
+        return self.layers(x)
 
     def hard_update(self, source):
         for target_param, source_param in zip(self.parameters(), source.parameters()):
