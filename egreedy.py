@@ -1,69 +1,29 @@
+import argparse
 import copy
+import pickle
+import random
+
+import gym
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from torch import nn
 from torch.autograd import Variable
 from torch.functional import F
-import numpy as np
 
 # import multiagent.scenarios as scenarios
 # from multiagent.environment import MultiAgentEnv
 from torch.optim import Adam
-import argparse
-import random
-from collections import namedtuple
-import gym
-import pickle
+
 import lbforaging
-import time
-from operator import itemgetter
-import matplotlib.pyplot as plt
+from replay import MultiAgentReplayBuffer, PrioritizedMultiAgentReplayBuffer
+from networks import FCNetwork
 
-from replay import PrioritizedMultiAgentReplayBuffer, MultiAgentReplayBuffer
+USE_GPU = False
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() and USE_GPU else "cpu")
 MSELoss = torch.nn.MSELoss()
 MAX_EPISODES = 100000
-
-
-class FCNetwork(nn.Module):
-    def __init__(self, dims):
-        """
-        Creates a network using ReLUs between layers and no activation at the end
-        :param dims: tuple in the form of (100, 100, ..., 5). for dim sizes
-        """
-        super().__init__()
-        h_sizes = dims[:-1]
-        out_size = dims[-1]
-
-        # Hidden layers
-        self.hidden = []
-        for k in range(len(h_sizes) - 1):
-            self.hidden.append(nn.Linear(h_sizes[k], h_sizes[k + 1]))
-            self.add_module("hidden_layer" + str(k), self.hidden[-1])
-
-        # Output layer
-        self.out = nn.Linear(h_sizes[-1], out_size)
-
-    @staticmethod
-    def calc_layer_size(size, extra):
-        if type(size) is int:
-            return size
-        return extra["size"]
-
-    def forward(self, x):
-        # Feedforward
-        for layer in self.hidden:
-            x = F.relu(layer(x))
-        output = self.out(x)
-        return output
-
-    def hard_update(self, source):
-        for target_param, source_param in zip(self.parameters(), source.parameters()):
-            target_param.data.copy_(source_param.data)
-
-    def soft_update(self, source, t):
-        for target_param, source_param in zip(self.parameters(), source.parameters()):
-            target_param.data.copy_((1 - t) * target_param.data + t * source_param.data)
 
 
 def onehot_from_logits(logits, epsilon=0.0):
@@ -140,12 +100,15 @@ class MADDPG:
         self.grad_clip = params["grad_clip"]
         self.epsilon_target = params["epsilon_target"]
         self.epsilon_anneal = params["epsilon_anneal"]
-        self.centralized = params["centralized_expl"]
+        self.expl_method = params["expl_method"]
 
         self.timesteps = 0
 
+        use_dropout = self.expl_method == "dropout"
         self.actors = [
-            FCNetwork((s.shape[0], *params["network_size"], a.n)).to(device)
+            FCNetwork(
+                (s.shape[0], *params["network_size"], a.n), dropout=use_dropout
+            ).to(device)
             for s, a in zip(state_sizes, action_sizes)
         ]
 
@@ -153,7 +116,9 @@ class MADDPG:
             [a.n for a in action_sizes]
         )
         self.critics = [
-            FCNetwork((critic_input_size, *params["network_size"], 1)).to(device)
+            FCNetwork(
+                (critic_input_size, *params["network_size"], 1), dropout=use_dropout
+            ).to(device)
             for _ in range(agent_count)
         ]
 
@@ -180,6 +145,42 @@ class MADDPG:
                 agent_count, params["buffer_size"]
             )
 
+    def select_actions_dropout(self, states):
+        return self.select_actions(states, explore=False)
+
+    def select_actions_coord_egreedy(self, states):
+        if np.random.uniform() >= self.epsilon:
+            return self.select_actions(states, explore=False)
+        actions = []
+        for i in range(len(states)):
+            action = torch.eye(self.action_size[i].n)[
+                np.random.choice(range(self.action_size[i].n), size=1)
+            ]
+            actions.append(action.squeeze().detach())
+        return actions
+
+    def select_actions_egreedy(self, states):
+        actions = []
+        for i, state in enumerate(states):
+            if np.random.uniform() < self.epsilon:
+                action = torch.eye(self.action_size[i].n)[
+                    np.random.choice(range(self.action_size[i].n), size=1)
+                ]
+
+            else:
+                sb = torch.Tensor(state).to(device)
+                action = onehot_from_logits(self.actors[i](sb.unsqueeze(0))).to("cpu")
+            actions.append(action.squeeze().detach())
+        return actions
+
+    def select_actions_gumbel(self, states):
+        actions = []
+        for i, state in enumerate(states):
+            sb = torch.Tensor(state).to(device)
+            action = gumbel_softmax(self.actors[i](sb.unsqueeze(0)), hard=True)
+            actions.append(action.squeeze().detach())
+        return actions
+
     def select_actions(self, states, explore=False):
         """
 
@@ -187,21 +188,23 @@ class MADDPG:
         :return: actions for each agent
         """
 
-        actions = []
-        if self.centralized:
-            rand = np.random.uniform()
-        for i, state in enumerate(states):
-            if not self.centralized:
-                rand = np.random.uniform()
-
-            sb = torch.Tensor(state).to(device)
-            if explore and rand < self.epsilon:
-                action = gumbel_softmax(torch.ones(6).unsqueeze(0), hard=True)
-            else:
+        if not explore:
+            actions = []
+            for i, state in enumerate(states):
+                sb = torch.Tensor(state).to(device)
                 action = onehot_from_logits(self.actors[i](sb.unsqueeze(0))).to("cpu")
-            actions.append(action.squeeze().detach())
+                actions.append(action.squeeze().detach())
+            return actions
 
-        return actions
+        if self.expl_method == "egreedy":
+            return self.select_actions_egreedy(states)
+        elif self.expl_method == "coord_egreedy":
+            return self.select_actions_coord_egreedy(states)
+        elif self.expl_method == "dropout":
+            return self.select_actions_dropout(states)
+        elif self.expl_method == "gumbel":
+            return self.select_actions_gumbel(states)
+        raise ValueError()
 
     def update(self, agent):
         """
@@ -418,8 +421,14 @@ if __name__ == "__main__":
     # and counters.
 
     parser = argparse.ArgumentParser()
-    # parser.add_argument('--hidden-layers', type=int, nargs='+', default=[64, 64])
     parser.add_argument("--gym-env", default="Foraging-8x8-2p-2f-v0", type=str)
+
+    parser.add_argument(
+        "--expl-method",
+        choices=["egreedy", "coord_egreedy", "gumbel", "dropout"],
+        default="egreedy",
+        type=str,
+    )
     parser.add_argument("--seed", default=None)
     parser.add_argument("--max-timesteps", default=1e7, type=float)
     parser.add_argument("--update-freq", type=float, default=100)
@@ -428,14 +437,13 @@ if __name__ == "__main__":
     parser.add_argument("--epsilon-target", type=float, default=0.1)
     parser.add_argument("--epsilon-anneal", type=float, default=1e7)
     parser.add_argument("--grad-clip", type=float, default=0.5)
-    parser.add_argument("--critic-lr", type=float, default=0.0001)
-    parser.add_argument("--actor-lr", type=float, default=0.00001)
+    parser.add_argument("--critic-lr", type=float, default=0.001)
+    parser.add_argument("--actor-lr", type=float, default=0.0001)
     parser.add_argument("--eval-episodes", type=int, default=20)
     parser.add_argument("--eval-every", type=int, default=10000)
     parser.add_argument("--buffer-size", type=int, default=1e7)
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--discount", type=float, default=0.9)
-    parser.add_argument("--centralized-expl", action="store_true")
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--prioritized-replay", action="store_true")
 
