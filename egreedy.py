@@ -10,13 +10,14 @@ import torch
 from torch import nn
 from torch.autograd import Variable
 from torch.functional import F
+from tqdm import tqdm
 
 # import multiagent.scenarios as scenarios
 # from multiagent.environment import MultiAgentEnv
 from torch.optim import Adam
 
 import lbforaging
-from replay import MultiAgentReplayBuffer, PrioritizedMultiAgentReplayBuffer
+from replay import MultiAgentReplayBuffer
 from networks import FCNetwork
 
 USE_GPU = False
@@ -136,17 +137,27 @@ class MADDPG:
         self.state_size = state_sizes
         self.action_size = action_sizes
 
-        if params["prioritized_replay"]:
-            self.replay_buffer = PrioritizedMultiAgentReplayBuffer(
-                agent_count, params["buffer_size"], alpha=0.6
-            )
-        else:
-            self.replay_buffer = MultiAgentReplayBuffer(
-                agent_count, params["buffer_size"]
-            )
+        self.replay_buffer = MultiAgentReplayBuffer(
+            agent_count, params["buffer_size"], device=device
+        )
 
-    def select_actions_dropout(self, states):
-        return self.select_actions(states, explore=False)
+    def select_actions_dropout(self, states, explore):
+        # return self.select_actions(states, explore=False)
+        actions = []
+
+        if explore:
+            for i, state in enumerate(states):
+                sb = torch.Tensor(state).to(device)
+                action = onehot_from_logits(self.actors[i](sb.unsqueeze(0))).to("cpu")
+                actions.append(action.squeeze().detach())
+            return actions
+        else:
+            for i, state in enumerate(states):
+                sb = torch.Tensor(state).repeat(100, 1).to(device)
+                action = onehot_from_logits(self.actors[i](sb)).to("cpu")
+                action = onehot_from_logits(action.sum(dim=0).unsqueeze(0))
+                actions.append(action.squeeze().detach())
+            return actions
 
     def select_actions_coord_egreedy(self, states):
         if np.random.uniform() >= self.epsilon:
@@ -188,7 +199,7 @@ class MADDPG:
         :return: actions for each agent
         """
 
-        if not explore:
+        if not explore and self.expl_method != "dropout":
             actions = []
             for i, state in enumerate(states):
                 sb = torch.Tensor(state).to(device)
@@ -201,7 +212,7 @@ class MADDPG:
         elif self.expl_method == "coord_egreedy":
             return self.select_actions_coord_egreedy(states)
         elif self.expl_method == "dropout":
-            return self.select_actions_dropout(states)
+            return self.select_actions_dropout(states, explore)
         elif self.expl_method == "gumbel":
             return self.select_actions_gumbel(states)
         raise ValueError()
@@ -214,7 +225,7 @@ class MADDPG:
         if len(self.replay_buffer) < self.batch_size:
             return
 
-        nbatch = self.replay_buffer.sample(self.batch_size, device=device)
+        nbatch = self.replay_buffer.sample(self.batch_size)
         jstates = torch.cat([batch.states for batch in nbatch], dim=1)
         jactions = torch.cat([batch.actions for batch in nbatch], dim=1)
         jnext_states = torch.cat([batch.next_states for batch in nbatch], dim=1)
@@ -244,10 +255,6 @@ class MADDPG:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.critics[agent].parameters(), self.grad_clip)
         self.critic_optimizers[agent].step()
-
-        if self.replay_buffer.can_prioritize:
-            errors = torch.abs(value - target_value).data.numpy().squeeze() + 0.001
-            self.replay_buffer.update_priorities(errors)
 
         ########## Update Actors ##################
 
@@ -288,8 +295,8 @@ class MADDPG:
                 a.detach().numpy()
                 for a in self.select_actions(obs_n, explore=(not evaluate))
             ]
-            if render:
-                print(actions)
+            # if render:
+            #     print(actions)
 
             # step environment
             next_obs_n, reward_n, done_n, _ = env.step(
@@ -299,8 +306,13 @@ class MADDPG:
 
             episode_rewards += reward_n
 
-            self.replay_buffer.push(obs_n, actions, next_obs_n, reward_n, done_n)
-
+            self.replay_buffer.push(
+                [o.astype(np.float32) for o in obs_n],
+                actions,
+                [o.astype(np.float32) for o in next_obs_n],
+                [np.array([r], dtype=np.float32) for r in reward_n],
+                [np.array([d], dtype=np.float32) for d in done_n],
+            )
             # render all agent views
             if render:
                 env.render()
@@ -355,7 +367,7 @@ def evaluate(env, maddpg, rewards, eval_episodes, eval_every, render):
     episode_rewards = np.zeros(maddpg.agent_count)
     for i in range(eval_episodes):
         episode_rewards += (
-            maddpg.play_episode(env, evaluate=True, render=render) / eval_episodes
+            maddpg.play_episode(env, evaluate=True, render=False) / eval_episodes
         )
 
     rewards = (
@@ -393,20 +405,26 @@ def main(**params):
     last_eval = 0
     saved_networks = []
 
-    while maddpg.timesteps <= params["max_timesteps"]:
-        _ = maddpg.play_episode(env, evaluate=False, render=False)
-        if maddpg.timesteps - last_eval >= params["eval_every"]:
-            last_eval = maddpg.timesteps
-            rewards = evaluate(
-                env,
-                maddpg,
-                rewards,
-                params["eval_episodes"],
-                params["eval_every"],
-                render=params["render"],
-            )
-            saved_networks.append([a.state_dict() for a in maddpg.actors])
-            print(maddpg.timesteps)
+    with tqdm(
+        total=params["max_timesteps"], smoothing=0.3, disable=not params["render"]
+    ) as pbar:
+        while maddpg.timesteps <= params["max_timesteps"]:
+            _ = maddpg.play_episode(env, evaluate=False, render=False)
+            pbar.update(env.current_step)
+            if maddpg.timesteps - last_eval >= params["eval_every"]:
+                pbar.set_description("Evaluating...")
+                last_eval = maddpg.timesteps
+                rewards = evaluate(
+                    env,
+                    maddpg,
+                    rewards,
+                    params["eval_episodes"],
+                    params["eval_every"],
+                    render=params["render"],
+                )
+                pbar.set_description("Training...")
+                saved_networks.append([a.state_dict() for a in maddpg.actors])
+                # print(maddpg.timesteps)
 
     return {
         "saved_networks": saved_networks,
@@ -445,7 +463,6 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--discount", type=float, default=0.9)
     parser.add_argument("--render", action="store_true")
-    parser.add_argument("--prioritized-replay", action="store_true")
 
     args = parser.parse_args()
 
