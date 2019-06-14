@@ -137,9 +137,7 @@ class MADDPG:
         self.state_size = state_sizes
         self.action_size = action_sizes
 
-        self.replay_buffer = MultiAgentReplayBuffer(
-            agent_count, params["buffer_size"], device=device
-        )
+        self.replay_buffer = MultiAgentReplayBuffer(agent_count, params["buffer_size"])
 
     def select_actions_dropout(self, states, explore):
         # return self.select_actions(states, explore=False)
@@ -225,7 +223,7 @@ class MADDPG:
         if len(self.replay_buffer) < self.batch_size:
             return
 
-        nbatch = self.replay_buffer.sample(self.batch_size)
+        nbatch = self.replay_buffer.sample(self.batch_size, device=device)
         jstates = torch.cat([batch.states for batch in nbatch], dim=1)
         jactions = torch.cat([batch.actions for batch in nbatch], dim=1)
         jnext_states = torch.cat([batch.next_states for batch in nbatch], dim=1)
@@ -459,7 +457,7 @@ if __name__ == "__main__":
     parser.add_argument("--actor-lr", type=float, default=0.0001)
     parser.add_argument("--eval-episodes", type=int, default=20)
     parser.add_argument("--eval-every", type=int, default=10000)
-    parser.add_argument("--buffer-size", type=int, default=1e7)
+    parser.add_argument("--buffer-size", type=int, default=1e8)
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--discount", type=float, default=0.9)
     parser.add_argument("--render", action="store_true")
