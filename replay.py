@@ -14,45 +14,57 @@ Transition = namedtuple(
 
 
 class ReplayBuffer:
-    def __init__(self, capacity, device="cpu"):
+    def __init__(self, capacity):
         self.capacity = int(capacity)
-        self.memory = []
-        self.position = 0
-        self.device = device
+        self.memory = None
+        self.writes = 0
 
-    def push(self, *args):
-        if len(self.memory) < self.capacity:
-            self.memory.append(None)
-        self.memory[self.position] = Transition(
-            *[torch.from_numpy(e).view(1, -1).to(self.device) for e in args]
+    def init_memory(self, transition):
+        for t in transition:
+            assert t.ndim == 1  # sanity check
+
+        self.memory = Transition(
+            *[np.zeros([self.capacity, t.size], dtype=t.dtype) for t in transition]
         )
 
-        self.position = (self.position + 1) % self.capacity
+    def push(self, *args):
+
+        if not self.memory:
+            self.init_memory(Transition(*args))
+
+        position = (self.writes) % self.capacity
+        for i, data in enumerate(args):
+            self.memory[i][position, :] = data
+
+        self.writes = self.writes + 1
 
     def sample(self, batch_size):
-        transitions = random.sample(self.memory, batch_size)
-        return Transition(*zip(*transitions))
+        raise NotImplementedError
 
     def __len__(self):
-        return len(self.memory)
+        return min(self.writes, self.capacity)
 
 
 class MultiAgentReplayBuffer:
-    def __init__(self, agents, capacity, device="cpu"):
+    def __init__(self, agents, capacity):
         self.agents = agents
-        self.sa_buffers = [ReplayBuffer(capacity, device) for _ in range(agents)]
+        self.sa_buffers = [ReplayBuffer(capacity) for _ in range(agents)]
         self.can_prioritize = False
 
     def __len__(self):
         return len(self.sa_buffers[0])
 
-    def sample(self, batch_size, device=None):
+    def sample(self, batch_size, device="cpu"):
         samples = np.random.randint(0, high=len(self), size=batch_size)
         agent_batches = []
 
         for buffer in self.sa_buffers:
-            transitions = itemgetter(*samples)(buffer.memory)
-            batch = Transition(*[torch.cat(e, dim=0) for e in zip(*transitions)])
+            batch = Transition(
+                *[
+                    torch.from_numpy(np.take(d, samples, axis=0)).to(device)
+                    for d in buffer.memory
+                ]
+            )
             agent_batches.append(batch)
 
         return agent_batches
