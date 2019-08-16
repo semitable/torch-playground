@@ -3,192 +3,403 @@
 """
 """
 
-import gym
-import math
+import argparse
+import copy
+import pickle
 import random
-import numpy as np
-import matplotlib.pyplot as plt
+import time
 from collections import namedtuple
-from itertools import count
+from operator import itemgetter
 
+import gym
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
+from torch import nn
 from torch.autograd import Variable
-import torchvision.transforms as T
+from torch.functional import F
 
-env = gym.make('CartPole-v0').unwrapped
+# import multiagent.scenarios as scenarios
+# from multiagent.environment import MultiAgentEnv
+from torch.optim import Adam
 
-plt.ion()
+import lbforaging
 
-# if gpu is to be used
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-Transition = namedtuple('Transition',
-                        ('state', 'action', 'next_state', 'reward'))
+MSELoss = torch.nn.MSELoss()
+MAX_EPISODES = 100000
 
 
-class ReplayMemory(object):
+Transition = namedtuple(
+    "Transition", ("states", "actions", "next_states", "rewards", "done")
+)
 
+
+class ReplayBuffer:
     def __init__(self, capacity):
-        self.capacity = capacity
+        self.capacity = int(capacity)
         self.memory = []
         self.position = 0
 
     def push(self, *args):
-        """Saves a transition."""
         if len(self.memory) < self.capacity:
             self.memory.append(None)
         self.memory[self.position] = Transition(*args)
         self.position = (self.position + 1) % self.capacity
 
     def sample(self, batch_size):
-        return random.sample(self.memory, batch_size)
+        transitions = random.sample(self.memory, batch_size)
+        return Transition(*zip(*transitions))
 
     def __len__(self):
         return len(self.memory)
 
 
-class DQN(nn.Module):
-    def __init__(self, num_inputs, num_actions):
-        super(DQN, self).__init__()
+class MultiAgentReplayBuffer:
+    def __init__(self, agents, capacity):
+        self.agents = agents
+        self.sa_buffers = [ReplayBuffer(capacity) for _ in range(agents)]
 
-        self.layers = nn.Sequential(
-            nn.Linear(num_inputs, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, num_actions)
+    def __len__(self):
+        return len(self.sa_buffers[0])
+
+    def sample(self, batch_size, tensorize=False):
+        samples = np.random.randint(0, high=len(self), size=batch_size)
+        agent_batches = []
+
+        for buffer in self.sa_buffers:
+            transitions = itemgetter(*samples)(buffer.memory)
+            if tensorize:
+                batch = Transition(
+                    *[torch.Tensor(e).view(batch_size, -1) for e in zip(*transitions)]
+                )
+            else:
+                batch = Transition(*zip(*transitions))
+            agent_batches.append(batch)
+
+        return agent_batches
+
+    def push(self, *args):
+        for i, buffer in enumerate(self.sa_buffers):
+            buffer.push(*[a[i] for a in args])
+
+
+def onehot_from_logits(logits, epsilon=0.0):
+    """
+    Given batch of logits, return one-hot sample using epsilon greedy strategy
+    (based on given epsilon)
+    """
+    # get best (according to current policy) actions in one-hot form
+    argmax_acs = (logits == logits.max(1, keepdim=True)[0]).float()
+    if epsilon == 0.0:
+        return argmax_acs
+    # get random actions in one-hot form
+    rand_acs = Variable(
+        torch.eye(logits.shape[1])[
+            [np.random.choice(range(logits.shape[1]), size=logits.shape[0])]
+        ],
+        requires_grad=False,
+    )
+    # chooses between best and random actions using epsilon greedy
+    return torch.stack(
+        [
+            argmax_acs[i] if r > epsilon else rand_acs[i]
+            for i, r in enumerate(torch.rand(logits.shape[0]))
+        ]
+    )
+
+
+class DDQN:
+    def __init__(self, params):
+        state_sizes = params["state_space"]
+        action_sizes = params["action_space"]
+        agent_count = len(action_sizes)
+
+        # self.discrete_actions = [True, True]
+
+        self.gamma = params["discount"]
+        self.update_freq = params["update_freq"]
+        self.target_update_freq = params["target_update_freq"]
+        self.batch_size = params["batch_size"]
+        self.grad_clip = params["grad_clip"]
+        self.epsilon_target = params["epsilon_target"]
+        self.use_dropout = params["dropout"]
+        self.epsilon_anneal = params["epsilon_anneal"]
+        self.centralized = params["centralized_expl"]
+
+        self.timesteps = 0
+
+        self.policies = [
+            FCNetwork(
+                (s.shape[0], *params["network_size"], a.n), dropout=params["dropout"]
+            )
+            for s, a in zip(state_sizes, action_sizes)
+        ]
+
+        self.policy_targets = copy.deepcopy(self.policies)
+
+        self.policy_optimizers = [
+            Adam(x.parameters(), lr=params["lr"]) for x in self.policies
+        ]
+
+        self.agent_count = agent_count
+        self.state_size = state_sizes
+        self.action_size = action_sizes
+
+        self.replay_buffer = MultiAgentReplayBuffer(agent_count, params["buffer_size"])
+
+    def select_actions(self, states, explore=False):
+        """
+
+        :param states: List of the agent states
+        :return: actions for each agent
+        """
+
+        actions = []
+        if self.centralized:
+            rand = np.random.uniform()
+        for i, state in enumerate(states):
+            if not self.centralized:
+                rand = np.random.uniform()
+
+            sb = torch.Tensor(state)
+            if explore and rand < self.epsilon:
+                action = onehot_from_logits(
+                    self.policies[i](sb.unsqueeze(0)), epsilon=1.0
+                )
+            else:
+                action = onehot_from_logits(self.policies[i](sb.unsqueeze(0)))
+            actions.append(action.squeeze().detach())
+
+        return actions
+
+    def update(self, agent):
+        """
+
+        :param agent: The agent ID)
+        """
+        if len(self.replay_buffer) < self.batch_size:
+            return
+
+        nbatch = self.replay_buffer.sample(self.batch_size, tensorize=True)
+        batch = nbatch[agent]
+
+        non_final_mask = torch.ByteTensor(tuple(map(lambda s: not s, batch.done)))
+
+        non_final_next_states = torch.stack(
+            [s for done, s in zip(batch.done, batch.next_states) if not done]
         )
 
-    def forward(self, x):
-        return self.layers(x)
+        state_batch = batch.states
+        action_batch = batch.actions
+        reward_batch = batch.rewards
+
+        state_action_values = (
+            (self.policies[agent](state_batch) * action_batch).sum(dim=1).view(-1, 1)
+        )
+
+        next_state_values = torch.zeros(self.batch_size)
+        best_actions = (
+            self.policies[agent](non_final_next_states).argmax(1).unsqueeze(-1)
+        )
+        next_state_values[non_final_mask] = (
+            self.policy_targets[agent](non_final_next_states)
+            .gather(dim=1, index=best_actions)
+            .squeeze()
+            .detach()
+        )
+        targets = (next_state_values * self.gamma) + reward_batch
+
+        loss = F.smooth_l1_loss(state_action_values, targets.unsqueeze(1))
+        self.policy_optimizers[agent].zero_grad()
+        loss.backward()
+        for param in self.policies[agent].parameters():
+            param.grad.data.clamp_(-self.grad_clip, self.grad_clip)
+        self.policy_optimizers[agent].step()
+
+    def update_epsilon(self):
+        ratio = min(1, float(self.timesteps) / self.epsilon_anneal)
+        self.epsilon = ratio * self.epsilon_target + (1 - ratio) * 1
+
+    def set_mode(self, mode):
+        for network in self.policies:
+            if mode == "eval":
+                network.eval()
+            elif mode == "train":
+                network.train()
+            else:
+                raise ValueError()
+
+    def play_episode(self, env, evaluate=False, render=False):
+        obs_n = env.reset()
+        episode_rewards = np.zeros(self.agent_count)
+        done = False
+        if not evaluate:
+            self.update_epsilon()
+
+        while not done:
+            # query for action from each agent's policy
+            # act_n = [np.array([0, 0, 1]), env.action_space[1].sample()]
+            actions = [
+                a.detach().numpy()
+                for a in self.select_actions(
+                    obs_n, explore=(not evaluate and not self.use_dropout)
+                )
+            ]
+            if render:
+                print(actions)
+
+            # step environment
+            next_obs_n, reward_n, done_n, _ = env.step(
+                [np.argmax(actions[0]), np.argmax(actions[1])]
+            )
+            done = np.all(done_n)
+
+            episode_rewards += reward_n
+
+            self.replay_buffer.push(obs_n, actions, next_obs_n, reward_n, done_n)
+
+            # render all agent views
+            if render:
+                env.render()
+
+            obs_n = next_obs_n
+
+            if evaluate:
+                continue
+
+            self.timesteps += 1
+
+            if self.timesteps % self.update_freq == 0:
+                for agent in range(self.agent_count):
+                    self.update(agent)
+
+            if self.timesteps % self.target_update_freq == 0:
+                for i in range(self.agent_count):
+                    self.policy_targets[i].hard_update(self.policies[i])
+
+        return episode_rewards
 
 
-def plot_durations():
-    plt.figure(2)
+def movingaverage(values, window):
+    weights = np.repeat(1.0, window) / window
+    sma = np.convolve(values, weights, "valid")
+    return sma
+
+
+def plot_rewards(rewards, eval_every):
+
+    ma_length = 10
+
+    plt.figure(1)
     plt.clf()
-    durations_t = torch.tensor(episode_durations, dtype=torch.float)
-    plt.title('Training...')
-    plt.xlabel('Episode')
-    plt.ylabel('Duration')
-    plt.plot(durations_t.numpy())
-    # Take 100 episode averages and plot them too
-    if len(durations_t) >= 100:
-        means = durations_t.unfold(0, 100, 1).mean(1).view(-1)
-        means = torch.cat((torch.zeros(99), means))
-        plt.plot(means.numpy())
+    # plt.yscale("symlog")
+    plt.title("Training...")
+    plt.xlabel("Timestep")
+    plt.ylabel("Reward")
 
+    x = np.arange(eval_every * len(np.sum(rewards, axis=1)), step=eval_every)
+    y = np.sum(rewards, axis=1)
+    yMA = movingaverage(y, ma_length)
+
+    plt.plot(x, y, "x")
+    if len(y) > ma_length:
+        plt.plot(x[len(x) - len(yMA) :], yMA, color="r")
     plt.pause(0.001)  # pause a bit so that plots are updated
 
 
-######################################################################
-# Training
-# --------
+def evaluate(env, maddpg, rewards, eval_episodes, eval_every, render):
+    maddpg.set_mode("eval")
+    episode_rewards = np.zeros(maddpg.agent_count)
+    for i in range(eval_episodes):
+        episode_rewards += (
+            maddpg.play_episode(env, evaluate=True, render=render) / eval_episodes
+        )
+    maddpg.set_mode("train")
+
+    rewards = (
+        np.vstack([rewards, episode_rewards])
+        if rewards is not None
+        else np.array([episode_rewards])
+    )
+    if render:
+        plot_rewards(rewards, eval_every)
+    return rewards
 
 
-BATCH_SIZE = 128
-GAMMA = 0.999
-EPS_START = 0.9
-EPS_END = 0.05
-EPS_DECAY = 200
-TARGET_UPDATE = 10
+def main(**params):
 
-state_dim = env.observation_space.shape[0]
-action_dim = env.action_space.n
+    plt.ion()
+    rewards = None
+    torch.set_num_threads(1)
+    seed = params["seed"]
 
-policy_net = DQN(state_dim, action_dim).to(device)
-target_net = DQN(state_dim, action_dim).to(device)
-target_net.load_state_dict(policy_net.state_dict())
-target_net.eval()
+    env = gym.make(params["gym_env"])
 
-optimizer = optim.Adam(policy_net.parameters())
-memory = ReplayMemory(10000)
+    if seed is not None:
+        torch.manual_seed(seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        env.seed(seed)
 
-steps_done = 0
-episode_durations = []
+    # env = make_env("simple_speaker_listener", discrete_action=True)
 
+    params.update({"state_space": env.observation_space})
+    params.update({"action_space": env.action_space})
 
-######################################################################
-# Training loop
-# ^^^^^^^^^^^^^
+    # print(env.action_space)
+    maddpg = DDQN(params)
+    last_eval = 0
+    saved_networks = []
 
-def get_batch(buffer, batch_size):
-    transitions = buffer.sample(batch_size)
-    return Transition(*zip(*transitions))
+    while maddpg.timesteps <= params["max_timesteps"]:
+        _ = maddpg.play_episode(env, evaluate=False, render=False)
+        if maddpg.timesteps - last_eval >= params["eval_every"]:
+            last_eval = maddpg.timesteps
+            rewards = evaluate(
+                env,
+                maddpg,
+                rewards,
+                params["eval_episodes"],
+                params["eval_every"],
+                render=params["render"],
+            )
+            saved_networks.append([a.state_dict() for a in maddpg.policies])
+            print(maddpg.timesteps)
 
-
-def select_action(state):
-    global steps_done
-    eps_threshold = EPS_END + (EPS_START - EPS_END) * math.exp(-1. * steps_done / EPS_DECAY)
-    steps_done += 1
-    if random.random() > eps_threshold:
-        with torch.no_grad():
-            return policy_net(state).argmax(1).view(1, 1)  # view as 2D
-    else:
-        return torch.LongTensor([[random.randrange(2)]]).to(device)
-
-
-def optimize_model():
-    if len(memory) < BATCH_SIZE:
-        return
-
-    batch = get_batch(memory, BATCH_SIZE)
-
-    non_final_mask = torch.ByteTensor(tuple(map(lambda s: s is not None, batch.next_state))).to(device)
-    non_final_next_states = torch.cat([s for s in batch.next_state if s is not None])
-
-    state_batch = torch.cat(batch.state)
-    action_batch = torch.cat(batch.action)
-    reward_batch = torch.cat(batch.reward)
-
-    state_action_values = policy_net(state_batch).gather(1, action_batch)
-
-    next_state_values = torch.zeros(BATCH_SIZE).to(device)
-    best_actions = policy_net(non_final_next_states).argmax(1).unsqueeze(-1)
-    next_state_values[non_final_mask] = target_net(non_final_next_states).gather(dim=1, index=best_actions).squeeze().detach()
-    targets = (next_state_values * GAMMA) + reward_batch
-
-    loss = F.smooth_l1_loss(state_action_values, targets.unsqueeze(1))
-    optimizer.zero_grad()
-    loss.backward()
-    for param in policy_net.parameters():
-        param.grad.data.clamp_(-1, 1)
-    optimizer.step()
+    return {
+        "saved_networks": saved_networks,
+        "freq": params["eval_every"],
+        "reruns": params["eval_episodes"],
+        "rewards": rewards,
+    }
 
 
-num_episodes = 5000
-for i_episode in range(num_episodes):
-    # Initialize the environment and state
-    state = torch.Tensor([env.reset()]).to(device)
+if __name__ == "__main__":
+    # Example on how to initialize global locks for processes
+    # and counters.
 
-    for t in count():
-        # Select and perform an action
-        action = select_action(state)
-        next_state, reward, done, _ = env.step(action.item())
+    parser = argparse.ArgumentParser()
+    # parser.add_argument('--hidden-layers', type=int, nargs='+', default=[64, 64])
+    parser.add_argument("--gym-env", default="Foraging-6x6-2p-1f-v0", type=str)
+    parser.add_argument("--seed", default=None)
+    parser.add_argument("--max-timesteps", default=1e7, type=float)
+    parser.add_argument("--update-freq", type=float, default=4)
+    parser.add_argument("--target-update-freq", type=float, default=10000)
+    parser.add_argument("--network-size", default=(64, 64))
+    parser.add_argument("--epsilon-target", type=float, default=0.1)
+    parser.add_argument("--epsilon-anneal", type=float, default=1e7)
+    parser.add_argument("--grad-clip", type=float, default=0.5)
+    parser.add_argument("--lr", type=float, default=0.0001)
+    parser.add_argument("--eval-episodes", type=int, default=50)
+    parser.add_argument("--eval-every", type=int, default=10000)
+    parser.add_argument("--buffer-size", type=int, default=1e8)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--discount", type=float, default=0.9)
+    parser.add_argument("--centralized-expl", action="store_true")
+    parser.add_argument("--dropout", action="store_true")
+    parser.add_argument("--render", action="store_true")
 
-        next_state = None if done else torch.Tensor([next_state]).to(device)
-        reward = torch.Tensor([reward]).to(device)
+    args = parser.parse_args()
 
-        # Store the transition in memory
-        memory.push(state, action, next_state, reward)
-
-        # Move to the next state
-        state = next_state
-
-        # Perform one step of the optimization (on the target network)
-        optimize_model()
-        if done:
-            episode_durations.append(t + 1)
-            plot_durations()
-            break
-    # Update the target network, copying all weights and biases in DQN
-    if i_episode % TARGET_UPDATE == 0:
-        target_net.load_state_dict(policy_net.state_dict())
-
-print('Complete')
-env.render()
-env.close()
-plt.ioff()
-plt.show()
+    data = main(**vars(args))
+    pickle.dump(data, open("egreedy.local.p", "wb"))

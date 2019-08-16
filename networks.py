@@ -15,7 +15,7 @@ class FCNetwork(nn.Module):
         for i in range(len(h_sizes) - 1):
             mods.append(nn.ReLU())
             if dropout:
-                mods.append(nn.Dropout(p=0.1))
+                mods.append(nn.Dropout(p=dropout))
             mods.append(nn.Linear(h_sizes[i], h_sizes[i + 1]))
 
         self.layers = nn.Sequential(*mods)

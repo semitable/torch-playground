@@ -1,23 +1,66 @@
 import copy
 import torch
+from torch import nn
 from torch.autograd import Variable
 from torch.functional import F
 import numpy as np
-import multiagent.scenarios as scenarios
-from multiagent.environment import MultiAgentEnv
+
+# import multiagent.scenarios as scenarios
+# from multiagent.environment import MultiAgentEnv
 from torch.optim import Adam
 import argparse
 import random
 from collections import namedtuple
 import gym
+import pickle
 import lbforaging
 import time
-from networks import FCNetwork
 from operator import itemgetter
 import matplotlib.pyplot as plt
 
 MSELoss = torch.nn.MSELoss()
 MAX_EPISODES = 100000
+
+
+class FCNetwork(nn.Module):
+    def __init__(self, dims):
+        """
+        Creates a network using ReLUs between layers and no activation at the end
+        :param dims: tuple in the form of (100, 100, ..., 5). for dim sizes
+        """
+        super().__init__()
+        h_sizes = dims[:-1]
+        out_size = dims[-1]
+
+        # Hidden layers
+        self.hidden = []
+        for k in range(len(h_sizes) - 1):
+            self.hidden.append(nn.Linear(h_sizes[k], h_sizes[k + 1]))
+            self.add_module("hidden_layer" + str(k), self.hidden[-1])
+
+        # Output layer
+        self.out = nn.Linear(h_sizes[-1], out_size)
+
+    @staticmethod
+    def calc_layer_size(size, extra):
+        if type(size) is int:
+            return size
+        return extra["size"]
+
+    def forward(self, x):
+        # Feedforward
+        for layer in self.hidden:
+            x = F.relu(layer(x))
+        output = self.out(x)
+        return output
+
+    def hard_update(self, source):
+        for target_param, source_param in zip(self.parameters(), source.parameters()):
+            target_param.data.copy_(source_param.data)
+
+    def soft_update(self, source, t):
+        for target_param, source_param in zip(self.parameters(), source.parameters()):
+            target_param.data.copy_((1 - t) * target_param.data + t * source_param.data)
 
 
 def make_env(scenario_name, benchmark=False, discrete_action=False):
@@ -174,9 +217,9 @@ class MultiAgentReplayBuffer:
 
 class MADDPG:
     def __init__(self, params):
-        state_sizes = [9, 9]
-        action_sizes = [6, 6]
         agent_count = 2
+        state_sizes = [params["state_space"]] * agent_count
+        action_sizes = [6, 6]
 
         # self.discrete_actions = [True, True]
 
@@ -185,17 +228,21 @@ class MADDPG:
         self.batch_size = params["batch_size"]
         self.target_tau = params["target_tau"]
         self.grad_clip = params["grad_clip"]
+        self.epsilon_target = params["epsilon_target"]
+        self.epsilon_anneal = params["epsilon_anneal"]
+        self.centralized = params["centralized_expl"]
 
         self.timesteps = 0
 
         self.actors = [
-            FCNetwork((state_sizes[i], 64, 64, action_sizes[i]))
+            FCNetwork((state_sizes[i], *params["network_size"], action_sizes[i]))
             for i in range(agent_count)
         ]
 
         critic_input_size = sum(state_sizes) + sum(action_sizes)
         self.critics = [
-            FCNetwork((critic_input_size, 64, 64, 1)) for i in range(agent_count)
+            FCNetwork((critic_input_size, *params["network_size"], 1))
+            for i in range(agent_count)
         ]
 
         self.actor_targets = copy.deepcopy(self.actors)
@@ -222,11 +269,15 @@ class MADDPG:
         """
 
         actions = []
-
+        if self.centralized:
+            rand = np.random.uniform()
         for i, state in enumerate(states):
+            if not self.centralized:
+                rand = np.random.uniform()
+
             sb = torch.Tensor(state)
-            if explore:
-                action = gumbel_softmax(self.actors[i](sb.unsqueeze(0)), hard=True)
+            if explore and rand < self.epsilon:
+                action = gumbel_softmax(torch.ones(6).unsqueeze(0), hard=True)
             else:
                 action = onehot_from_logits(self.actors[i](sb.unsqueeze(0)))
             actions.append(action.squeeze().detach())
@@ -294,10 +345,16 @@ class MADDPG:
         torch.nn.utils.clip_grad_norm_(self.actors[agent].parameters(), self.grad_clip)
         self.actor_optimizers[agent].step()
 
+    def update_epsilon(self):
+        ratio = min(1, float(self.timesteps) / self.epsilon_anneal)
+        self.epsilon = ratio * self.epsilon_target + (1 - ratio) * 1
+
     def play_episode(self, env, evaluate=False, render=False):
         obs_n = env.reset()
         episode_rewards = np.zeros(2)
         done = False
+        if not evaluate:
+            self.update_epsilon()
 
         while not done:
             # query for action from each agent's policy
@@ -342,22 +399,38 @@ class MADDPG:
         return episode_rewards
 
 
-def plot_rewards(rewards):
+def movingaverage(values, window):
+    weights = np.repeat(1.0, window) / window
+    sma = np.convolve(values, weights, "valid")
+    return sma
+
+
+def plot_rewards(rewards, eval_every):
+
+    ma_length = 50
+
     plt.figure(1)
     plt.clf()
     # plt.yscale("symlog")
     plt.title("Training...")
-    plt.xlabel("Episode")
-    plt.ylabel("Duration")
-    plt.plot(np.sum(rewards, axis=1))
+    plt.xlabel("Timestep")
+    plt.ylabel("Reward")
+
+    x = np.arange(eval_every * len(np.sum(rewards, axis=1)), step=eval_every)
+    y = np.sum(rewards, axis=1)
+    yMA = movingaverage(y, ma_length)
+
+    plt.plot(x, y, "x")
+    if len(y) > ma_length:
+        plt.plot(x[len(x) - len(yMA) :], yMA, color="r")
     plt.pause(0.001)  # pause a bit so that plots are updated
 
 
-def evaluate(env, maddpg, rewards, eval_episodes):
+def evaluate(env, maddpg, rewards, eval_episodes, eval_every, render):
     episode_rewards = np.zeros(2)
     for i in range(eval_episodes):
         episode_rewards += (
-            maddpg.play_episode(env, evaluate=True, render=True) / eval_episodes
+            maddpg.play_episode(env, evaluate=True, render=render) / eval_episodes
         )
 
     rewards = (
@@ -365,8 +438,8 @@ def evaluate(env, maddpg, rewards, eval_episodes):
         if rewards is not None
         else np.array([episode_rewards])
     )
-    plot_rewards(rewards)
-    print(rewards)
+    if render:
+        plot_rewards(rewards, eval_every)
     return rewards
 
 
@@ -374,17 +447,44 @@ def main(**params):
 
     plt.ion()
     rewards = None
+    torch.set_num_threads(1)
+    seed = params["seed"]
 
-    env = make_env("simple_speaker_listener", discrete_action=True)
-    # env = gym.make("Foraging-5x5-2p-v0")
-    # print(env.observation_space)
+    env = gym.make(params["gym_env"])
+
+    if seed is not None:
+        torch.manual_seed(seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        env.seed(seed)
+
+    # env = make_env("simple_speaker_listener", discrete_action=True)
+
+    params.update({"state_space": env.observation_space.shape[0]})
+
     # print(env.action_space)
     maddpg = MADDPG(params)
-    for i in range(MAX_EPISODES):
+    last_eval = 0
+    while maddpg.timesteps <= params["max_timesteps"]:
         _ = maddpg.play_episode(env, evaluate=False, render=False)
-        if i % params["eval_every"] == 0:
-            rewards = evaluate(env, maddpg, rewards, params["eval_episodes"])
-            print("Episode: ", i)
+        if maddpg.timesteps - last_eval >= params["eval_every"]:
+            last_eval = maddpg.timesteps
+            rewards = evaluate(
+                env,
+                maddpg,
+                rewards,
+                params["eval_episodes"],
+                params["eval_every"],
+                render=params["render"],
+            )
+            print(maddpg.timesteps)
+
+    return {
+        "network": [a.state_dict() for a in maddpg.actors],
+        "freq": params["eval_every"],
+        "reruns": params["eval_episodes"],
+        "rewards": rewards,
+    }
 
 
 if __name__ == "__main__":
@@ -393,19 +493,26 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     # parser.add_argument('--hidden-layers', type=int, nargs='+', default=[64, 64])
+    parser.add_argument("--gym-env", default="Foraging-6x6-2p-2f-v0", type=str)
+    parser.add_argument("--seed", default=None)
     parser.add_argument("--max-timesteps", default=1e7, type=float)
     parser.add_argument("--update-freq", type=float, default=100)
     parser.add_argument("--target-tau", type=float, default=0.01)
+    parser.add_argument("--network-size", default=(64, 64))
+    parser.add_argument("--epsilon-target", type=float, default=0.1)
+    parser.add_argument("--epsilon-anneal", type=float, default=1e7)
     parser.add_argument("--grad-clip", type=float, default=0.5)
-    parser.add_argument("--critic-lr", type=float, default=0.001)
+    parser.add_argument("--critic-lr", type=float, default=0.0001)
     parser.add_argument("--actor-lr", type=float, default=0.0001)
     parser.add_argument("--eval-episodes", type=int, default=20)
-    parser.add_argument("--eval-every", type=int, default=500)
+    parser.add_argument("--eval-every", type=int, default=1000)
     parser.add_argument("--buffer-size", type=int, default=1e8)
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--discount", type=float, default=0.9)
-    # parser.add_argument('--render-evals', action='store_true')
+    parser.add_argument("--centralized-expl", action="store_true")
+    parser.add_argument("--render", action="store_true")
 
     args = parser.parse_args()
 
-    main(**vars(args))
+    data = main(**vars(args))
+    pickle.dump(data, open("egreedy.local.p", "wb"))
